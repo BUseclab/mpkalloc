@@ -1,0 +1,1696 @@
+diff --git a/base/allocator/BUILD.gn b/base/allocator/BUILD.gn
+index eb808ba..9595f56 100644
+--- a/base/allocator/BUILD.gn
++++ b/base/allocator/BUILD.gn
+@@ -159,6 +159,8 @@ if (use_allocator == "tcmalloc") {
+       "$tcmalloc_dir/src/stack_trace_table.cc",
+       "$tcmalloc_dir/src/stack_trace_table.h",
+       "$tcmalloc_dir/src/stacktrace.cc",
++      "$tcmalloc_dir/src/mpkalloc_vars.h",
++      "$tcmalloc_dir/src/mpkalloc_vars.cc",
+       "$tcmalloc_dir/src/static_vars.cc",
+       "$tcmalloc_dir/src/static_vars.h",
+       "$tcmalloc_dir/src/symbolize.cc",
+diff --git a/base/allocator/allocator_shim_default_dispatch_to_tcmalloc.cc b/base/allocator/allocator_shim_default_dispatch_to_tcmalloc.cc
+index 29afc06..40461fe 100644
+--- a/base/allocator/allocator_shim_default_dispatch_to_tcmalloc.cc
++++ b/base/allocator/allocator_shim_default_dispatch_to_tcmalloc.cc
+@@ -2,17 +2,55 @@
+ // Use of this source code is governed by a BSD-style license that can be
+ // found in the LICENSE file.
+ 
++#include <sys/ipc.h>
++#include <sys/shm.h>
++
+ #include "base/allocator/allocator_shim.h"
+ #include "base/allocator/allocator_shim_internals.h"
+ 
+ #include "third_party/tcmalloc/chromium/src/config.h"
++#include "third_party/tcmalloc/chromium/src/mpkalloc_vars.h"
+ #include "third_party/tcmalloc/chromium/src/gperftools/tcmalloc.h"
+ 
+ namespace {
+ 
+ using base::allocator::AllocatorDispatch;
+ 
+ void* TCMalloc(const AllocatorDispatch*, size_t size, void* context) {
++  /**
++  // MPK stats 
++  bytes_allocated += size;
++
++  // ftok to generate unique key
++  key_t key = ftok("shmfile", 65);
++
++  // shmget returns an identifier in shmid
++  int shmid = shmget(key, sizeof(unsigned long)*5*4, 0666|IPC_CREAT);
++
++  // shmat to attach to shared memory
++  unsigned long *data = (unsigned long*)shmat(shmid,(void*)0,0);
++
++  int bin = 0;
++  int bytes = size;
++
++  if (bytes < 32) {
++    bin = 0;
++  } else if (bytes < 1024) {
++    bin = 1;
++  } else if (bytes < 32768) {
++    bin = 2;
++  } else if (bytes < 1048576) {
++    bin = 3;
++  } else if (bytes < 1073741824) {
++    bin = 4;
++  }
++
++  data[0*5+bin] += 1;
++
++  shmdt(data);
++  */ 
+   return tc_malloc(size);
+ }
+ 
+diff --git a/base/allocator/partition_allocator/partition_alloc.cc b/base/allocator/partition_allocator/partition_alloc.cc
+index 1160260..9c41b54 100644
+--- a/base/allocator/partition_allocator/partition_alloc.cc
++++ b/base/allocator/partition_allocator/partition_alloc.cc
+@@ -198,6 +198,7 @@ void PartitionAllocGlobalInit(OomFunction on_out_of_memory) {
+ }
+ 
+ void PartitionRoot::Init(size_t bucket_count, size_t maximum_allocation) {
++  disable_defense();
+   PartitionAllocBaseInit(this);
+ 
+   num_buckets = bucket_count;
+@@ -206,9 +207,11 @@ void PartitionRoot::Init(size_t bucket_count, size_t maximum_allocation) {
+     internal::PartitionBucket& bucket = buckets()[i];
+     bucket.Init(i == 0 ? kAllocationGranularity : (i << kBucketShift));
+   }
++  enable_defense();
+ }
+ 
+ void PartitionRootGeneric::Init() {
++  disable_defense();
+   subtle::SpinLock::Guard guard(lock);
+ 
+   PartitionAllocBaseInit(this);
+@@ -291,11 +294,13 @@ void PartitionRootGeneric::Init() {
+   // And there's one last bucket lookup that will be hit for e.g. malloc(-1),
+   // which tries to overflow to a non-existant order.
+   *bucket_ptr = internal::PartitionBucket::get_sentinel_bucket();
++  enable_defense();
+ }
+ 
+ bool PartitionReallocDirectMappedInPlace(PartitionRootGeneric* root,
+                                          internal::PartitionPage* page,
+                                          size_t raw_size) {
++  disable_defense();
+   DCHECK(page->bucket->is_direct_mapped());
+ 
+   raw_size = internal::PartitionCookieSizeAdjustAdd(raw_size);
+@@ -303,9 +308,10 @@ bool PartitionReallocDirectMappedInPlace(PartitionRootGeneric* root,
+   // Note that the new size might be a bucketed size; this function is called
+   // whenever we're reallocating a direct mapped allocation.
+   size_t new_size = internal::PartitionBucket::get_direct_map_size(raw_size);
+-  if (new_size < kGenericMinDirectMappedDownsize)
++  if (new_size < kGenericMinDirectMappedDownsize) {
++    enable_defense();
+     return false;
+-
++  }
+   // bucket->slot_size is the current size of the allocation.
+   size_t current_size = page->bucket->slot_size;
+   char* char_ptr = static_cast<char*>(internal::PartitionPage::ToPointer(page));
+@@ -317,9 +323,10 @@ bool PartitionReallocDirectMappedInPlace(PartitionRootGeneric* root,
+ 
+     // Don't reallocate in-place if new size is less than 80 % of the full
+     // map size, to avoid holding on to too much unused address space.
+-    if ((new_size / kSystemPageSize) * 5 < (map_size / kSystemPageSize) * 4)
++    if ((new_size / kSystemPageSize) * 5 < (map_size / kSystemPageSize) * 4) {
++      enable_defense();
+       return false;
+-
++    }
+     // Shrink by decommitting unneeded pages and making them inaccessible.
+     size_t decommit_size = current_size - new_size;
+     root->DecommitSystemPages(char_ptr + new_size, decommit_size);
+@@ -338,6 +345,7 @@ bool PartitionReallocDirectMappedInPlace(PartitionRootGeneric* root,
+   } else {
+     // We can't perform the realloc in-place.
+     // TODO: support this too when possible.
++    enable_defense();
+     return false;
+   }
+ 
+@@ -351,6 +359,7 @@ bool PartitionReallocDirectMappedInPlace(PartitionRootGeneric* root,
+   DCHECK(page->get_raw_size() == raw_size);
+ 
+   page->bucket->slot_size = new_size;
++  enable_defense();
+   return true;
+ }
+ 
+@@ -359,6 +368,7 @@ void* PartitionReallocGenericFlags(PartitionRootGeneric* root,
+                                    void* ptr,
+                                    size_t new_size,
+                                    const char* type_name) {
++  disable_defense();
+ #if defined(MEMORY_TOOL_REPLACES_ALLOCATOR)
+   CHECK_MAX_SIZE_OR_RETURN_NULLPTR(new_size, flags);
+   void* result = realloc(ptr, new_size);
+@@ -369,6 +379,7 @@ void* PartitionReallocGenericFlags(PartitionRootGeneric* root,
+     return PartitionAllocGenericFlags(root, flags, new_size, type_name);
+   if (UNLIKELY(!new_size)) {
+     root->Free(ptr);
++    enable_defense();
+     return nullptr;
+   }
+ 
+@@ -400,6 +411,7 @@ void* PartitionReallocGenericFlags(PartitionRootGeneric* root,
+           PartitionAllocHooks::ReallocObserverHookIfEnabled(ptr, ptr, new_size,
+                                                             type_name);
+         }
++        enable_defense();
+         return ptr;
+       }
+     }
+@@ -421,6 +433,7 @@ void* PartitionReallocGenericFlags(PartitionRootGeneric* root,
+       if (page->get_raw_size_ptr())
+         internal::PartitionCookieWriteValue(static_cast<char*>(ptr) + new_size);
+ #endif
++      enable_defense();
+       return ptr;
+     }
+   }
+@@ -428,8 +441,10 @@ void* PartitionReallocGenericFlags(PartitionRootGeneric* root,
+   // This realloc cannot be resized in-place. Sadness.
+   void* ret = PartitionAllocGenericFlags(root, flags, new_size, type_name);
+   if (!ret) {
+-    if (flags & PartitionAllocReturnNull)
++    if (flags & PartitionAllocReturnNull) {
++      enable_defense();
+       return nullptr;
++    }
+     internal::PartitionExcessiveAllocationSize(new_size);
+   }
+ 
+@@ -439,6 +454,7 @@ void* PartitionReallocGenericFlags(PartitionRootGeneric* root,
+ 
+   memcpy(ret, ptr, copy_size);
+   root->Free(ptr);
++  enable_defense();
+   return ret;
+ #endif
+ }
+@@ -457,11 +473,13 @@ void* PartitionRootGeneric::TryRealloc(void* ptr,
+ }
+ 
+ static size_t PartitionPurgePage(internal::PartitionPage* page, bool discard) {
++  disable_defense();
+   const internal::PartitionBucket* bucket = page->bucket;
+   size_t slot_size = bucket->slot_size;
+-  if (slot_size < kSystemPageSize || !page->num_allocated_slots)
++  if (slot_size < kSystemPageSize || !page->num_allocated_slots) {
++    enable_defense();
+     return 0;
+-
++  }
+   size_t bucket_num_slots = bucket->get_slots_per_span();
+   size_t discardable_bytes = 0;
+ 
+@@ -475,6 +493,7 @@ static size_t PartitionPurgePage(internal::PartitionPage* page, bool discard) {
+       ptr += used_bytes;
+       DiscardSystemPages(ptr, discardable_bytes);
+     }
++    enable_defense();
+     return discardable_bytes;
+   }
+ 
+@@ -600,10 +619,12 @@ static size_t PartitionPurgePage(internal::PartitionPage* page, bool discard) {
+         DiscardSystemPages(begin_ptr, partial_slot_bytes);
+     }
+   }
++  enable_defense();
+   return discardable_bytes;
+ }
+ 
+ static void PartitionPurgeBucket(internal::PartitionBucket* bucket) {
++  disable_defense();
+   if (bucket->active_pages_head !=
+       internal::PartitionPage::get_sentinel_page()) {
+     for (internal::PartitionPage* page = bucket->active_pages_head; page;
+@@ -612,18 +633,22 @@ static void PartitionPurgeBucket(internal::PartitionBucket* bucket) {
+       PartitionPurgePage(page, true);
+     }
+   }
++  enable_defense();
+ }
+ 
+ void PartitionRoot::PurgeMemory(int flags) {
++  disable_defense();
+   if (flags & PartitionPurgeDecommitEmptyPages)
+     DecommitEmptyPages();
+   // We don't currently do anything for PartitionPurgeDiscardUnusedSystemPages
+   // here because that flag is only useful for allocations >= system page size.
+   // We only have allocations that large inside generic partitions at the
+   // moment.
++  enable_defense();
+ }
+ 
+ void PartitionRootGeneric::PurgeMemory(int flags) {
++  disable_defense();
+   subtle::SpinLock::Guard guard(lock);
+   if (flags & PartitionPurgeDecommitEmptyPages)
+     DecommitEmptyPages();
+@@ -634,14 +659,17 @@ void PartitionRootGeneric::PurgeMemory(int flags) {
+         PartitionPurgeBucket(bucket);
+     }
+   }
++  enable_defense();
+ }
+ 
+ static void PartitionDumpPageStats(PartitionBucketMemoryStats* stats_out,
+                                    internal::PartitionPage* page) {
++  disable_defense();
+   uint16_t bucket_num_slots = page->bucket->get_slots_per_span();
+ 
+   if (page->is_decommitted()) {
+     ++stats_out->num_decommitted_pages;
++    enable_defense();
+     return;
+   }
+ 
+@@ -668,10 +696,12 @@ static void PartitionDumpPageStats(PartitionBucketMemoryStats* stats_out,
+     DCHECK(page->is_active());
+     ++stats_out->num_active_pages;
+   }
++  enable_defense();
+ }
+ 
+ static void PartitionDumpBucketStats(PartitionBucketMemoryStats* stats_out,
+                                      const internal::PartitionBucket* bucket) {
++  disable_defense();
+   DCHECK(!bucket->is_direct_mapped());
+   stats_out->is_valid = false;
+   // If the active page list is empty (==
+@@ -680,9 +710,10 @@ static void PartitionDumpBucketStats(PartitionBucketMemoryStats* stats_out,
+   if (bucket->active_pages_head ==
+           internal::PartitionPage::get_sentinel_page() &&
+       !bucket->empty_pages_head && !bucket->decommitted_pages_head &&
+-      !bucket->num_full_pages)
++      !bucket->num_full_pages) {
++    enable_defense();
+     return;
+-
++  }
+   memset(stats_out, '\0', sizeof(*stats_out));
+   stats_out->is_valid = true;
+   stats_out->is_direct_map = false;
+@@ -714,11 +745,13 @@ static void PartitionDumpBucketStats(PartitionBucketMemoryStats* stats_out,
+       PartitionDumpPageStats(stats_out, page);
+     }
+   }
++  enable_defense();
+ }
+ 
+ void PartitionRootGeneric::DumpStats(const char* partition_name,
+                                      bool is_light_dump,
+                                      PartitionStatsDumper* dumper) {
++  disable_defense();
+   PartitionMemoryStats stats = {0};
+   stats.total_mmapped_bytes =
+       total_size_of_super_pages + total_size_of_direct_mapped_pages;
+@@ -798,11 +831,13 @@ void PartitionRootGeneric::DumpStats(const char* partition_name,
+   stats.total_resident_bytes += direct_mapped_allocations_total_size;
+   stats.total_active_bytes += direct_mapped_allocations_total_size;
+   dumper->PartitionDumpTotals(partition_name, &stats);
++  enable_defense();
+ }
+ 
+ void PartitionRoot::DumpStats(const char* partition_name,
+                               bool is_light_dump,
+                               PartitionStatsDumper* dumper) {
++  disable_defense();
+   PartitionMemoryStats stats = {0};
+   stats.total_mmapped_bytes = total_size_of_super_pages;
+   stats.total_committed_bytes = total_size_of_committed_pages;
+@@ -844,6 +879,7 @@ void PartitionRoot::DumpStats(const char* partition_name,
+     }
+   }
+   dumper->PartitionDumpTotals(partition_name, &stats);
++  enable_defense();
+ }
+ 
+ }  // namespace base
+diff --git a/base/allocator/partition_allocator/partition_alloc.h b/base/allocator/partition_allocator/partition_alloc.h
+index 06ecc57..f88f56b 100644
+--- a/base/allocator/partition_allocator/partition_alloc.h
++++ b/base/allocator/partition_allocator/partition_alloc.h
+@@ -60,6 +60,10 @@
+ // - Better checking for wild pointers in free().
+ // - Better freelist masking function to guarantee fault on 32-bit.
+ 
++#include <sys/ipc.h>
++#include <sys/shm.h>
++#include <sys/types.h>
++
+ #include <limits.h>
+ #include <string.h>
+ 
+@@ -93,6 +97,14 @@
+     CHECK(false);                                     \
+   }
+ 
++
++/**
++extern "C" int ftok(const char *path, int proj);
++extern "C" int shmget(int key, size_t size, int shmflg);
++extern "C" void* shmat(int shmid, const void *shmaddr, int shmflg);
++extern "C" int shmdt(const void *shmaddr);
++*/
++
+ namespace base {
+ 
+ class PartitionStatsDumper;
+@@ -291,7 +303,11 @@ class BASE_EXPORT PartitionAllocHooks {
+ };
+ 
+ ALWAYS_INLINE void* PartitionRoot::Alloc(size_t size, const char* type_name) {
+-  return AllocFlags(0, size, type_name);
++  // MPK context switch
++  disable_defense();
++  void *p = AllocFlags(0, size, type_name);
++  enable_defense();
++  return p;
+ }
+ 
+ ALWAYS_INLINE void* PartitionRoot::AllocFlags(int flags,
+@@ -303,6 +319,7 @@ ALWAYS_INLINE void* PartitionRoot::AllocFlags(int flags,
+   CHECK(result);
+   return result;
+ #else
++  disable_defense();
+   DCHECK(max_allocation == 0 || size <= max_allocation);
+   void* result;
+   const bool hooks_enabled = PartitionAllocHooks::AreHooksEnabled();
+@@ -311,6 +328,7 @@ ALWAYS_INLINE void* PartitionRoot::AllocFlags(int flags,
+                                                              size, type_name)) {
+       PartitionAllocHooks::AllocationObserverHookIfEnabled(result, size,
+                                                            type_name);
++      enable_defense();
+       return result;
+     }
+   }
+@@ -326,6 +344,7 @@ ALWAYS_INLINE void* PartitionRoot::AllocFlags(int flags,
+     PartitionAllocHooks::AllocationObserverHookIfEnabled(result, requested_size,
+                                                          type_name);
+   }
++  enable_defense();
+   return result;
+ #endif  // defined(MEMORY_TOOL_REPLACES_ALLOCATOR)
+ }
+@@ -341,13 +360,16 @@ ALWAYS_INLINE bool PartitionAllocSupportsGetSize() {
+ ALWAYS_INLINE size_t PartitionAllocGetSize(void* ptr) {
+   // No need to lock here. Only |ptr| being freed by another thread could
+   // cause trouble, and the caller is responsible for that not happening.
++  disable_defense();
+   DCHECK(PartitionAllocSupportsGetSize());
+   ptr = internal::PartitionCookieFreePointerAdjust(ptr);
+   internal::PartitionPage* page = internal::PartitionPage::FromPointer(ptr);
+   // TODO(palmer): See if we can afford to make this a CHECK.
+   DCHECK(internal::PartitionRootBase::IsValidPage(page));
+   size_t size = page->bucket->slot_size;
+-  return internal::PartitionCookieSizeAdjustSubtract(size);
++  size_t sz = internal::PartitionCookieSizeAdjustSubtract(size);
++  enable_defense();
++  return sz;
+ }
+ 
+ ALWAYS_INLINE void PartitionFree(void* ptr) {
+@@ -356,10 +378,13 @@ ALWAYS_INLINE void PartitionFree(void* ptr) {
+ #else
+   // TODO(palmer): Check ptr alignment before continuing. Shall we do the check
+   // inside PartitionCookieFreePointerAdjust?
++  disable_defense();
+   if (PartitionAllocHooks::AreHooksEnabled()) {
+     PartitionAllocHooks::FreeObserverHookIfEnabled(ptr);
+-    if (PartitionAllocHooks::FreeOverrideHookIfEnabled(ptr))
++    if (PartitionAllocHooks::FreeOverrideHookIfEnabled(ptr)) {
++      enable_defense();
+       return;
++    }
+   }
+ 
+   ptr = internal::PartitionCookieFreePointerAdjust(ptr);
+@@ -368,12 +393,14 @@ ALWAYS_INLINE void PartitionFree(void* ptr) {
+   DCHECK(internal::PartitionRootBase::IsValidPage(page));
+   internal::DeferredUnmap deferred_unmap = page->Free(ptr);
+   deferred_unmap.Run();
++  enable_defense();
+ #endif
+ }
+ 
+ ALWAYS_INLINE internal::PartitionBucket* PartitionGenericSizeToBucket(
+     PartitionRootGeneric* root,
+     size_t size) {
++  disable_defense();
+   size_t order = kBitsPerSizeT - bits::CountLeadingZeroBitsSizeT(size);
+   // The order index is simply the next few bits after the most significant bit.
+   size_t order_index = (size >> root->order_index_shifts[order]) &
+@@ -386,6 +413,7 @@ ALWAYS_INLINE internal::PartitionBucket* PartitionGenericSizeToBucket(
+   CHECK(bucket);
+   DCHECK(!bucket->slot_size || bucket->slot_size >= size);
+   DCHECK(!(bucket->slot_size % kGenericSmallestBucket));
++  enable_defense();
+   return bucket;
+ }
+ 
+@@ -394,6 +422,36 @@ ALWAYS_INLINE void* PartitionAllocGenericFlags(PartitionRootGeneric* root,
+                                                size_t size,
+                                                const char* type_name) {
+   DCHECK_LT(flags, PartitionAllocLastFlag << 1);
++  disable_defense();
++  /** 
++  // ftok to generate unique key
++  key_t key = ftok("shmfile", 65);
++
++  // shmget returns an identifier in shmid
++  int shmid = shmget(key, sizeof(unsigned long)*5*4, 0666|01000);
++
++  // shmat to attach to shared memory
++  unsigned long *data = (unsigned long*)shmat(shmid,(void*)0,0);
++
++  int bin = 0;
++  size_t bytes = size;
++
++  if (bytes < 32) {
++    bin = 0;
++  } else if (bytes < 1024) {
++    bin = 1;
++  } else if (bytes < 32768) {
++    bin = 2;
++  } else if (bytes < 1048576) {
++    bin = 3;
++  } else if (bytes < 1073741824) {
++    bin = 4;
++  }
++
++  data[1*5+bin] += 1;
++
++  shmdt(data);
++  */
+ 
+ #if defined(MEMORY_TOOL_REPLACES_ALLOCATOR)
+   CHECK_MAX_SIZE_OR_RETURN_NULLPTR(size, flags);
+@@ -412,6 +470,7 @@ ALWAYS_INLINE void* PartitionAllocGenericFlags(PartitionRootGeneric* root,
+                                                              size, type_name)) {
+       PartitionAllocHooks::AllocationObserverHookIfEnabled(result, size,
+                                                            type_name);
++      enable_defense();
+       return result;
+     }
+   }
+@@ -426,35 +485,47 @@ ALWAYS_INLINE void* PartitionAllocGenericFlags(PartitionRootGeneric* root,
+     PartitionAllocHooks::AllocationObserverHookIfEnabled(result, requested_size,
+                                                          type_name);
+   }
+-
++  enable_defense();
+   return result;
+ #endif
+ }
+ 
+ ALWAYS_INLINE void* PartitionRootGeneric::Alloc(size_t size,
+                                                 const char* type_name) {
+-  return PartitionAllocGenericFlags(this, 0, size, type_name);
++  disable_defense();
++  void *p = PartitionAllocGenericFlags(this, 0, size, type_name);
++  enable_defense();
++  return p;
+ }
+ 
+ ALWAYS_INLINE void* PartitionRootGeneric::AllocFlags(int flags,
+                                                      size_t size,
+                                                      const char* type_name) {
+-  return PartitionAllocGenericFlags(this, flags, size, type_name);
++  disable_defense();
++  void *p = PartitionAllocGenericFlags(this, flags, size, type_name);
++  enable_defense();
++  return p;
+ }
+ 
+ ALWAYS_INLINE void PartitionRootGeneric::Free(void* ptr) {
++  disable_defense();
++
+ #if defined(MEMORY_TOOL_REPLACES_ALLOCATOR)
+   free(ptr);
+ #else
+   DCHECK(initialized);
+ 
+-  if (UNLIKELY(!ptr))
++  if (UNLIKELY(!ptr)) {
++    enable_defense();
+     return;
++  }
+ 
+   if (PartitionAllocHooks::AreHooksEnabled()) {
+     PartitionAllocHooks::FreeObserverHookIfEnabled(ptr);
+-    if (PartitionAllocHooks::FreeOverrideHookIfEnabled(ptr))
++    if (PartitionAllocHooks::FreeOverrideHookIfEnabled(ptr)) {
++      enable_defense();
+       return;
++    }
+   }
+ 
+   ptr = internal::PartitionCookieFreePointerAdjust(ptr);
+@@ -468,6 +539,7 @@ ALWAYS_INLINE void PartitionRootGeneric::Free(void* ptr) {
+   }
+   deferred_unmap.Run();
+ #endif
++  enable_defense();
+ }
+ 
+ BASE_EXPORT void* PartitionReallocGenericFlags(PartitionRootGeneric* root,
+@@ -477,6 +549,7 @@ BASE_EXPORT void* PartitionReallocGenericFlags(PartitionRootGeneric* root,
+                                                const char* type_name);
+ 
+ ALWAYS_INLINE size_t PartitionRootGeneric::ActualSize(size_t size) {
++  disable_defense();
+ #if defined(MEMORY_TOOL_REPLACES_ALLOCATOR)
+   return size;
+ #else
+@@ -490,7 +563,9 @@ ALWAYS_INLINE size_t PartitionRootGeneric::ActualSize(size_t size) {
+   } else {
+     size = internal::PartitionBucket::get_direct_map_size(size);
+   }
+-  return internal::PartitionCookieSizeAdjustSubtract(size);
++  size_t size1 = internal::PartitionCookieSizeAdjustSubtract(size);
++  enable_defense();
++  return size1;
+ #endif
+ }
+ 
+diff --git a/base/allocator/partition_allocator/partition_bucket.cc b/base/allocator/partition_allocator/partition_bucket.cc
+index 0ff8661..44cf6ed 100644
+--- a/base/allocator/partition_allocator/partition_bucket.cc
++++ b/base/allocator/partition_allocator/partition_bucket.cc
+@@ -14,6 +14,17 @@
+ #include "base/logging.h"
+ #include "build/build_config.h"
+ 
++#include "third_party/tcmalloc/chromium/src/mpkalloc_vars.h"
++
++#include <unistd.h>
++#include <sys/mman.h>
++#include <sys/syscall.h>
++#include <sys/types.h>
++
++#define PKEY_DISABLE_ACCESS 0x1
++#define PKEY_MPROTECT_NO 329
++#define PKEY_ALLOC_NO 330
++
+ namespace base {
+ namespace internal {
+ 
+@@ -61,6 +72,26 @@ ALWAYS_INLINE PartitionPage* PartitionDirectMap(PartitionRootBase* root,
+   PartitionSuperPageExtentEntry* extent =
+       reinterpret_cast<PartitionSuperPageExtentEntry*>(
+           PartitionSuperPageToMetadataArea(ptr));
++
++  int pkey = tcmalloc::MPKStatic::pkey();
++
++  if (getenv("MPKALLOC_VERBOSE")) {
++    fprintf(stderr, "Tagging Meta-Data %p with %u %zx\n", extent, pkey, kSystemPageSize);
++  }
++
++  // Tag the meta-data page.
++  int status = syscall(PKEY_MPROTECT_NO, extent, kSystemPageSize, PROT_READ | PROT_WRITE, pkey);
++
++  CHECK(status != -1)
++    << "pkey_mprotect failure!" << strerror(errno);
++
++  /**
++  if (status == -1) {
++    Log(kLog, __FILE__, __LINE__,
++         "pkey_mprotect failure!", strerror(errno));
++  } */
++
++
+   extent->root = root;
+   // The new structures are all located inside a fresh system page so they
+   // will all be zeroed out. These DCHECKs are for documentation.
+@@ -273,6 +304,7 @@ ALWAYS_INLINE void* PartitionBucket::AllocNewSlotSpan(
+   PartitionSuperPageExtentEntry* latest_extent =
+       reinterpret_cast<PartitionSuperPageExtentEntry*>(
+           PartitionSuperPageToMetadataArea(super_page));
++
+   // By storing the root in every extent metadata object, we have a fast way
+   // to go from a pointer within the partition to the root object.
+   latest_extent->root = root;
+@@ -455,6 +487,7 @@ void* PartitionBucket::SlowPathAlloc(PartitionRootBase* root,
+                                      int flags,
+                                      size_t size,
+                                      bool* is_already_zeroed) {
++  disable_defense();
+   // The slow path is called when the freelist is empty.
+   DCHECK(!active_pages_head->freelist_head);
+ 
+@@ -476,8 +509,10 @@ void* PartitionBucket::SlowPathAlloc(PartitionRootBase* root,
+     DCHECK(this == get_sentinel_bucket());
+     DCHECK(active_pages_head == PartitionPage::get_sentinel_page());
+     if (size > kGenericMaxDirectMapped) {
+-      if (return_null)
++      if (return_null) {
++        enable_defense();
+         return nullptr;
++      }
+       PartitionExcessiveAllocationSize(size);
+     }
+     new_page = PartitionDirectMap(root, flags, size);
+@@ -533,8 +568,10 @@ void* PartitionBucket::SlowPathAlloc(PartitionRootBase* root,
+   // Bail if we had a memory allocation failure.
+   if (UNLIKELY(!new_page)) {
+     DCHECK(active_pages_head == PartitionPage::get_sentinel_page());
+-    if (return_null)
++    if (return_null) {
++      enable_defense();
+       return nullptr;
++    }
+     root->OutOfMemory(size);
+   }
+ 
+@@ -554,11 +591,14 @@ void* PartitionBucket::SlowPathAlloc(PartitionRootBase* root,
+         EncodedPartitionFreelistEntry::Decode(entry->next);
+     new_page->freelist_head = new_head;
+     new_page->num_allocated_slots++;
++    enable_defense();
+     return entry;
+   }
+   // Otherwise, we need to build the freelist.
+   DCHECK(new_page->num_unprovisioned_slots);
+-  return AllocAndFillFreelist(new_page);
++  void *p = AllocAndFillFreelist(new_page);
++  enable_defense();
++  return p;
+ }
+ 
+ }  // namespace internal
+diff --git a/base/allocator/partition_allocator/partition_page.h b/base/allocator/partition_allocator/partition_page.h
+index a4849b1..b0c37a59 100644
+--- a/base/allocator/partition_allocator/partition_page.h
++++ b/base/allocator/partition_allocator/partition_page.h
+@@ -14,6 +14,59 @@
+ #include "base/allocator/partition_allocator/random.h"
+ #include "base/logging.h"
+ 
++#include "third_party/tcmalloc/chromium/src/mpkalloc_vars.h"
++
++static inline void pkey_write(unsigned int pkru) {
++    asm volatile(".byte 0x0f,0x01,0xef\n\t"
++                 : : "a" (pkru), "c" (0), "d" (0));
++}
++
++static
++inline unsigned int pkey_read() {
++    unsigned int result;
++    asm volatile(".byte 0x0f,0x01,0xee\n\t"
++                 : "=a" (result) : "c" (0) : "rdx");
++    return result;
++}
++
++#define PKEY_DISABLE_ACCESS 0x1
++#define PKEY_DISABLE_WRITE  0x2
++
++static inline void mpkalloc_pkey_set(int key) {
++    unsigned int perms = (PKEY_DISABLE_ACCESS | PKEY_DISABLE_WRITE) << (2 * key);
++    unsigned int pkru = pkey_read();
++    // Check whether rights are already set
++    if (pkru & perms) {
++        return;
++    }
++    pkey_write(pkru | perms);
++}
++
++static inline void mpkalloc_pkey_unset(int key) {
++    unsigned int perms = (PKEY_DISABLE_ACCESS | PKEY_DISABLE_WRITE) << (2 * key);
++    unsigned int pkru = pkey_read();
++
++    // Rights are already unset
++    if (!(pkru & perms)) {
++        return;
++    }
++
++    pkey_write(pkru & ~perms);
++}
++
++static inline void enable_defense() {
++  //fprintf(stderr, "Enabling defense!\n");
++  //tcmalloc::MPKStatic::increment_context_switches();
++  mpkalloc_pkey_set(tcmalloc::MPKStatic::pkey());
++  return;
++}
++
++static inline void disable_defense() {
++  //fprintf(stderr, "Disabling defense!\n");
++  mpkalloc_pkey_unset(tcmalloc::MPKStatic::pkey());
++  return;
++}
++
+ namespace base {
+ namespace internal {
+ 
+@@ -217,6 +270,7 @@ ALWAYS_INLINE size_t PartitionPage::get_raw_size() const {
+ }
+ 
+ ALWAYS_INLINE DeferredUnmap PartitionPage::Free(void* ptr) {
++  disable_defense();
+ #if DCHECK_IS_ON()
+   size_t slot_size = bucket->slot_size;
+   const size_t raw_size = get_raw_size();
+@@ -250,6 +304,7 @@ ALWAYS_INLINE DeferredUnmap PartitionPage::Free(void* ptr) {
+     // correctly update the size metadata.
+     DCHECK(get_raw_size() == 0);
+   }
++  enable_defense();
+   return {};
+ }
+ 
+diff --git a/build/config/BUILDCONFIG.gn b/build/config/BUILDCONFIG.gn
+index 6f5d5f1..6ae8c12 100644
+--- a/build/config/BUILDCONFIG.gn
++++ b/build/config/BUILDCONFIG.gn
+@@ -152,7 +152,8 @@ declare_args() {
+ 
+ declare_args() {
+   # Debug build. Enabling official builds automatically sets is_debug to false.
+-  is_debug = !is_official_build
++  # is_debug = !is_official_build
++  is_debug = false
+ }
+ 
+ declare_args() {
+diff --git a/chrome/app/chrome_main.cc b/chrome/app/chrome_main.cc
+index e4799b9..29b9d83 100644
+--- a/chrome/app/chrome_main.cc
++++ b/chrome/app/chrome_main.cc
+@@ -3,6 +3,9 @@
+ // found in the LICENSE file.
+ 
+ #include <stdint.h>
++#include <stdio.h>
++
++#include <fstream>
+ 
+ #include "base/bind.h"
+ #include "base/callback_helpers.h"
+@@ -17,6 +20,7 @@
+ #include "content/public/common/content_switches.h"
+ #include "headless/public/headless_shell.h"
+ #include "ui/gfx/switches.h"
++#include "third_party/tcmalloc/chromium/src/mpkalloc_vars.h"
+ 
+ #if defined(OS_MACOSX)
+ #include "chrome/app/chrome_main_mac.h"
+diff --git a/headless/app/headless_shell.cc b/headless/app/headless_shell.cc
+index 7e703fa..1f6828e 100644
+--- a/headless/app/headless_shell.cc
++++ b/headless/app/headless_shell.cc
+@@ -2,6 +2,7 @@
+ // Use of this source code is governed by a BSD-style license that can be
+ // found in the LICENSE file.
+ 
++#include <iostream>
+ #include <memory>
+ #include <sstream>
+ #include <string>
+@@ -46,6 +47,7 @@
+ #include "net/socket/ssl_client_socket.h"
+ #include "net/ssl/ssl_key_logger_impl.h"
+ #include "services/network/public/cpp/network_switches.h"
++#include "third_party/tcmalloc/chromium/src/mpkalloc_vars.h"
+ #include "ui/gfx/geometry/size.h"
+ 
+ #if defined(OS_WIN)
+@@ -858,8 +863,17 @@ int HeadlessBrowserMain(
+   DCHECK(!base::CommandLine::ForCurrentProcess()->HasSwitch(
+       ::switches::kProcessType));
+ #endif
+-  return RunContentMain(std::move(options),
++  int rv = RunContentMain(std::move(options),
+                         std::move(on_browser_start_callback));
++  //int switches = tcmalloc::MPKStatic::context_switches();
++
++  // std::ofstream outputFile( "/tmp/switches" );
++  // std::cout << switches << std::endl;
++
++  // To write out the number of switches to a file.
++  // std::cout << switches << std::endl;
++
++  return rv;
+ }
+ 
+ }  // namespace headless
+diff --git a/third_party/blink/renderer/core/css/parser/css_property_parser_helpers.cc b/third_party/blink/renderer/core/css/parser/css_property_parser_helpers.cc
+index b194927..bfea5a7 100644
+--- a/third_party/blink/renderer/core/css/parser/css_property_parser_helpers.cc
++++ b/third_party/blink/renderer/core/css/parser/css_property_parser_helpers.cc
+@@ -37,6 +37,11 @@
+ #include "third_party/blink/renderer/platform/instrumentation/use_counter.h"
+ #include "third_party/blink/renderer/platform/runtime_enabled_features.h"
+ 
++typedef struct {
++  void *chunk;
++  size_t size; 
++} metadata_chunk; 
++
+ namespace blink {
+ 
+ namespace css_property_parser_helpers {
+@@ -2139,6 +2146,7 @@ bool ConsumeShorthandVia4Longhands(
+   return range.AtEnd();
+ }
+ 
++// mpkalloc: BUG 
+ bool ConsumeShorthandGreedilyViaLonghands(
+     const StylePropertyShorthand& shorthand,
+     bool important,
+@@ -2147,6 +2155,65 @@ bool ConsumeShorthandGreedilyViaLonghands(
+     HeapVector<CSSPropertyValue, 256>& properties) {
+   // Existing shorthands have at most 6 longhands.
+   DCHECK_LE(shorthand.length(), 6u);
++
++  /**
++  if (getenv("MPKALLOC_DEMO")) {
++    uint64_t rsp;
++
++    asm volatile ("mov %%rsp, %0" 
++          : "=a" (rsp)
++          : 
++          : "rsp");
++
++    uint64_t *stackptr = (uint64_t*)rsp; 
++
++    // ftok to generate unique key 
++    key_t key = ftok("/root/shm/metadata", 65);
++
++    // shmget returns an identifier in shmid
++    int shmid = shmget(key, sizeof(metadata_chunk)*1024, 0666|IPC_CREAT);
++
++    if (shmid == -1) {
++      perror("Could not create shared memory segment.");
++      exit(1);
++    }
++
++    // shmat to attach to shared memory 
++    intptr_t shm = (intptr_t)shmat(shmid,(void*)0, 0);
++
++    if (shm == -1) {
++      perror("Could not attach to shared memory!");
++      exit(1);
++    }
++
++    metadata_chunk *metadata = (metadata_chunk*)shm; 
++    printf("Looking for heap meta-data in ConsumeShorthandGreedilyViaLonghands\n");
++
++    for (int i = 0; i < 9000; i++) { 
++      // Walk the list to find a match.
++      for (metadata_chunk *p = metadata; p < &metadata[1024]; p++) {
++        if (p->size == 0) {
++          break;
++        }
++        uint64_t chunkptr = (uint64_t)p->chunk;
++        if ((chunkptr < *stackptr) && (*stackptr < (chunkptr + p->size))) {
++           uint64_t *q = (uint64_t*)*stackptr;
++           // 0x%lx
++           printf("HIT!\n%-20s: %p\n%-20s: %p\n%-20s: %zu\n", "stackptr", q, "metadata page", p->chunk, "size:", p->size);
++           q[0] = 0; // Trigger the defense and kill the process.
++        }
++      }
++      stackptr++;
++    }
++
++    shmdt((void*)shm);
++  }
++  */
+   const CSSValue* longhands[6] = {nullptr, nullptr, nullptr,
+                                   nullptr, nullptr, nullptr};
+   const CSSProperty** shorthand_properties = shorthand.properties();
+diff --git a/third_party/blink/renderer/platform/heap/heap.h b/third_party/blink/renderer/platform/heap/heap.h
+index 953dd78..e6a5a6c 100644
+--- a/third_party/blink/renderer/platform/heap/heap.h
++++ b/third_party/blink/renderer/platform/heap/heap.h
+@@ -34,6 +34,9 @@
+ #include <limits>
+ #include <memory>
+ 
++#include <sys/ipc.h>
++#include <sys/shm.h>
++
+ #include "base/macros.h"
+ #include "build/build_config.h"
+ #include "third_party/blink/renderer/platform/heap/finalizer_traits.h"
+@@ -644,8 +647,38 @@ inline Address ThreadHeap::AllocateOnArenaIndex(ThreadState* state,
+   return address;
+ }
+ 
++// MPKAlloc Tracing Allocator Utilization
+ template <typename T>
+ Address ThreadHeap::Allocate(size_t size) {
++    /**
++    // ftok to generate unique key
++    key_t key = ftok("shmfile", 65);
++
++    // shmget returns an identifier in shmid
++    int shmid = shmget(key, sizeof(unsigned long)*5*4, 0666|IPC_CREAT);
++
++    // shmat to attach to shared memory
++    unsigned long *data = (unsigned long*)shmat(shmid,(void*)0,0);
++
++    int bin = 0;
++    size_t bytes = size;
++ 
++    if (bytes < 32) {
++      bin = 0;
++    } else if (bytes < 1024) {
++      bin = 1;
++    } else if (bytes < 32768) {
++      bin = 2;
++    } else if (bytes < 1048576) {
++      bin = 3;
++    } else if (bytes < 1073741824) {
++      bin = 4;
++    }
++
++    data[2*5+bin] += 1;
++
++    shmdt(data);
++    */
+   ThreadState* state = ThreadStateFor<ThreadingTrait<T>::kAffinity>::GetState();
+   const char* type_name = WTF_HEAP_PROFILER_TYPE_NAME(T);
+   return state->Heap().AllocateOnArenaIndex(
+diff --git a/third_party/blink/renderer/platform/heap/heap_allocator.h b/third_party/blink/renderer/platform/heap/heap_allocator.h
+index 867165c..b4e9335 100644
+--- a/third_party/blink/renderer/platform/heap/heap_allocator.h
++++ b/third_party/blink/renderer/platform/heap/heap_allocator.h
+@@ -7,6 +7,9 @@
+ 
+ #include <type_traits>
+ 
++#include <sys/ipc.h>
++#include <sys/shm.h>
++
+ #include "build/build_config.h"
+ #include "third_party/blink/renderer/platform/heap/collection_support/heap_hash_table_backing.h"
+ #include "third_party/blink/renderer/platform/heap/collection_support/heap_vector_backing.h"
+diff --git a/third_party/blink/renderer/platform/wtf/allocator/partitions.cc b/third_party/blink/renderer/platform/wtf/allocator/partitions.cc
+index abb17ca..54d565e 100644
+--- a/third_party/blink/renderer/platform/wtf/allocator/partitions.cc
++++ b/third_party/blink/renderer/platform/wtf/allocator/partitions.cc
+@@ -95,16 +95,20 @@ void Partitions::StartPeriodicReclaim(
+ void Partitions::DumpMemoryStats(
+     bool is_light_dump,
+     base::PartitionStatsDumper* partition_stats_dumper) {
++  disable_defense();
+   // Object model and rendering partitions are not thread safe and can be
+   // accessed only on the main thread.
+   DCHECK(IsMainThread());
+ 
++  /**
+   FastMallocPartition()->DumpStats("fast_malloc", is_light_dump,
+                                    partition_stats_dumper);
+   ArrayBufferPartition()->DumpStats("array_buffer", is_light_dump,
+                                     partition_stats_dumper);
+   BufferPartition()->DumpStats("buffer", is_light_dump, partition_stats_dumper);
+   LayoutPartition()->DumpStats("layout", is_light_dump, partition_stats_dumper);
++  */
++  enable_defense();
+ }
+ 
+ namespace {
+diff --git a/third_party/tcmalloc/chromium/src/common.cc b/third_party/tcmalloc/chromium/src/common.cc
+index 170ce7d..f474cf8 100644
+--- a/third_party/tcmalloc/chromium/src/common.cc
++++ b/third_party/tcmalloc/chromium/src/common.cc
+@@ -31,17 +31,30 @@
+ // ---
+ // Author: Sanjay Ghemawat <opensource@google.com>
+ 
++#include <sys/stat.h>
++#include <fcntl.h>
++#include <unistd.h>
++
++#include <stdio.h>
+ #include <stdlib.h> // for getenv and strtol
+ #include "config.h"
+ #include "common.h"
+ #include "system-alloc.h"
+ #include "base/spinlock.h"
+ #include "getenv_safe.h" // TCMallocGetenvSafe
++#include "static_vars.h"
++#include "mpkalloc_vars.h"
++
++#include <sys/mman.h>
++#include <sys/shm.h>
+ 
+ #if defined(HAVE_UNISTD_H) && defined(HAVE_GETPAGESIZE)
+ #include <unistd.h>  // for getpagesize
+ #endif
+ 
++// static metadata_chunk metadata_pointers[1024];
++// static metadata_chunk *current = &metadata_pointers[0];
++
+ namespace tcmalloc {
+ 
+ // Define the maximum number of object per classe type to transfer between
+@@ -253,7 +266,64 @@ static size_t metadata_chunk_avail_;
+ 
+ static SpinLock metadata_alloc_lock(SpinLock::LINKER_INITIALIZED);
+ 
++static void save_pointer(void *ptr, size_t bytes) {
++    /**
++    Log(kLog, __FILE__, __LINE__,
++        "metadata page: ", getpid(), ptr, bytes);
++    */
++
++    /**
++    current->chunk = ptr;
++    current->size = bytes;
++    current++;
++    if (current == &metadata_pointers[1024]) {
++        printf("FAILED!");
++        exit(1);
++    } */
++
++    /**
++    if (getenv("MPKALLOC_DEMO")) {
++    // ftok to generate unique key 
++    key_t key = ftok("/root/shm/metadata", 65);
++
++    // shmget returns an identifier in shmid
++    int shmid = shmget(key, sizeof(metadata_chunk)*1024, 0666|IPC_CREAT);
++
++    if (shmid == -1) {
++        perror("Could not create shared memory segment.");
++        exit(1);
++    }
++
++    // shmat to attach to shared memory 
++    intptr_t shm = (intptr_t)shmat(shmid,(void*)0, 0);
++
++    if (shm == -1) {
++        perror("Could not attach to shared memory!");
++        exit(1);
++    }
++
++    metadata_chunk *metadata = (metadata_chunk*)shm;
++
++    Log(kLog, __FILE__, __LINE__,
++        "shm: ", shm);
++
++    // Walk the list to find an empty slot. 
++    for (metadata_chunk *p = metadata; p < &metadata[1024]; p++) {
++        if (p->size == 0) {
++           p->chunk = ptr;
++           p->size = bytes;
++           break;
++        }
++    }
++
++    shmdt((void*)shm);
++    } */
++
++}
++
+ void* MetaDataAlloc(size_t bytes) {
++  int pkey = MPKStatic::pkey();
++
+   static size_t pagesize;
+ #ifdef HAVE_GETPAGESIZE
+   if (pagesize == 0)
+@@ -271,7 +341,20 @@ void* MetaDataAlloc(size_t bytes) {
+       // add something like TCMalloc_SystemRemoveGuard.
+       TCMalloc_SystemAddGuard(rv, bytes + pagesize);
+       rv = static_cast<void*>(static_cast<char*>(rv) + pagesize);
++
++      int status = syscall(PKEY_MPROTECT_NO, rv, bytes, PROT_READ | PROT_WRITE, pkey);
++      
++      /**
++      Log(kLog, __FILE__, __LINE__,
++        "calling pkey_mprotect: ", rv, bytes, status);
++      */
++
++      if (status == -1) {
++          Log(kLog, __FILE__, __LINE__,
++              "pkey_mprotect failure!", strerror(errno));
++      }
+     }
++    save_pointer(rv, bytes + pagesize);
+     return rv;
+   }
+ 
+@@ -305,6 +388,21 @@ void* MetaDataAlloc(size_t bytes) {
+   metadata_chunk_alloc_ += bytes;
+   metadata_chunk_avail_ -= bytes;
+   metadata_system_bytes_ += bytes;
++
++  int status = syscall(PKEY_MPROTECT_NO, rv, bytes, PROT_READ | PROT_WRITE, pkey);
++
++  /**
++  Log(kLog, __FILE__, __LINE__,
++      "calling pkey_mprotect: ", rv, bytes, status);
++  */
++
++  if (status == -1) {
++     Log(kLog, __FILE__, __LINE__,
++         "pkey_mprotect failure!", strerror(errno));
++  }
++
++  save_pointer(rv, bytes);
++
+   return rv;
+ }
+ 
+diff --git a/third_party/tcmalloc/chromium/src/common.h b/third_party/tcmalloc/chromium/src/common.h
+index 7ad83d3..d5c345f 100644
+--- a/third_party/tcmalloc/chromium/src/common.h
++++ b/third_party/tcmalloc/chromium/src/common.h
+@@ -51,6 +51,11 @@ typedef uintptr_t PageID;
+ // Type that can hold the length of a run of pages
+ typedef uintptr_t Length;
+ 
++typedef struct {
++    void *chunk;
++    size_t size;
++} metadata_chunk;
++
+ //-------------------------------------------------------------------
+ // Configuration
+ //-------------------------------------------------------------------
+diff --git a/third_party/tcmalloc/chromium/src/mpkalloc_vars.cc b/third_party/tcmalloc/chromium/src/mpkalloc_vars.cc
+new file mode 100644
+index 0000000..0b123c4
+--- /dev/null
++++ b/third_party/tcmalloc/chromium/src/mpkalloc_vars.cc
+@@ -0,0 +1,9 @@
++#include "mpkalloc_vars.h"
++
++namespace tcmalloc {
++
++  unsigned long *MPKStatic::context_switches_area_ = 0;
++  int MPKStatic::context_switches_ = 0;
++  int MPKStatic::pkey_ = 0;
++
++}
+diff --git a/third_party/tcmalloc/chromium/src/mpkalloc_vars.h b/third_party/tcmalloc/chromium/src/mpkalloc_vars.h
+new file mode 100644
+index 0000000..fdc9e761
+--- /dev/null
++++ b/third_party/tcmalloc/chromium/src/mpkalloc_vars.h
+@@ -0,0 +1,40 @@
++#ifndef TCMALLOC_MPKALLOC_VARS_H_
++#define TCMALLOC_MPKALLOC_VARS_H_
++
++#define PKEY_DISABLE_ACCESS 0x1
++#define PKEY_MPROTECT_NO 329
++#define PKEY_ALLOC_NO 330
++
++namespace tcmalloc {
++
++class MPKStatic {
++  public:
++  static void increment_context_switches() {
++    context_switches_++;
++    (*context_switches_area_)++;
++  }
++
++  static void pkey(int pkey) {
++    pkey_ = pkey;
++  }
++
++  static void context_switches_area(unsigned long *map) {
++    context_switches_area_ = map;
++  }
++
++  static int context_switches() {
++    return context_switches_;
++  }
++
++  static int pkey() {
++    return pkey_;
++  }
++
++  static unsigned long *context_switches_area_;
++  static int context_switches_;
++  static int pkey_;
++};
++
++}
++
++#endif
+diff --git a/third_party/tcmalloc/chromium/src/pagemap.h b/third_party/tcmalloc/chromium/src/pagemap.h
+index 68b2d24c..dec7444 100644
+--- a/third_party/tcmalloc/chromium/src/pagemap.h
++++ b/third_party/tcmalloc/chromium/src/pagemap.h
+@@ -149,10 +149,15 @@ class TCMalloc_PageMap2 {
+     if ((k >> BITS) > 0 || root_[i1] == NULL) {
+       return NULL;
+     }
+-    return root_[i1]->values[i2];
++    void *r = root_[i1]->values[i2];
++    Log(tcmalloc::kLog, __FILE__, __LINE__,
++        "setting metadata for page: ", k, r);
++    return r; 
+   }
+ 
+   void set(Number k, void* v) {
++    Log(tcmalloc::kLog, __FILE__, __LINE__,
++        "setting metadata for page: ", k, v);
+     const Number i1 = k >> LEAF_BITS;
+     const Number i2 = k & (LEAF_LENGTH-1);
+     ASSERT(i1 < ROOT_LENGTH);
+@@ -196,7 +201,10 @@ class TCMalloc_PageMap2 {
+         // Scan forward in leaf
+         for (Number i2 = k & (LEAF_LENGTH - 1); i2 < LEAF_LENGTH; i2++) {
+           if (leaf->values[i2] != NULL) {
+-            return leaf->values[i2];
++            void *r = leaf->values[i2];
++            Log(tcmalloc::kLog, __FILE__, __LINE__,
++              "Next chunk of memory to describe page: ", k, r);
++            return r;
+           }
+         }
+       }
+@@ -213,7 +221,7 @@ class TCMalloc_PageMap3 {
+  private:
+   // How many bits should we consume at each interior level
+   static const int INTERIOR_BITS = (BITS + 2) / 3; // Round-up
+-  static const int INTERIOR_LENGTH = 1 << INTERIOR_BITS;
++  static const int INTERIOR_LENGTH = 2 << INTERIOR_BITS;
+ 
+   // How many bits should we consume at leaf level
+   static const int LEAF_BITS = BITS - 2*INTERIOR_BITS;
+@@ -257,7 +265,11 @@ class TCMalloc_PageMap3 {
+         root_.ptrs[i1] == NULL || root_.ptrs[i1]->ptrs[i2] == NULL) {
+       return NULL;
+     }
+-    return reinterpret_cast<Leaf*>(root_.ptrs[i1]->ptrs[i2])->values[i3];
++    void *r = reinterpret_cast<Leaf*>(root_.ptrs[i1]->ptrs[i2])->values[i3];
++    /**
++    Log(tcmalloc::kLog, __FILE__, __LINE__,
++        "getting metadata for page: ", k, r); */
++    return r;;
+   }
+ 
+   void set(Number k, void* v) {
+diff --git a/third_party/tcmalloc/chromium/src/static_vars.cc b/third_party/tcmalloc/chromium/src/static_vars.cc
+index da68094..48665f0 100644
+--- a/third_party/tcmalloc/chromium/src/static_vars.cc
++++ b/third_party/tcmalloc/chromium/src/static_vars.cc
+@@ -44,6 +44,14 @@
+ #include "getenv_safe.h"       // TCMallocGetenvSafe
+ #include "base/googleinit.h"
+ #include "maybe_threads.h"
++#include "mpkalloc_vars.h"
++
++#include <unistd.h>
++#include <sys/syscall.h>
++#include <sys/mman.h>
++#include <sys/stat.h>
++#include <sys/types.h>
++#include <fcntl.h>
+ 
+ namespace tcmalloc {
+ 
+@@ -67,6 +75,8 @@ void CentralCacheUnlockAll()
+ }
+ #endif
+ 
+ bool Static::inited_;
+ SpinLock Static::pageheap_lock_(SpinLock::LINKER_INITIALIZED);
+ SizeMap Static::sizemap_;
+@@ -77,8 +87,32 @@ Span Static::sampled_objects_;
+ PageHeapAllocator<StackTraceTable::Bucket> Static::bucket_allocator_;
+ StackTrace* Static::growth_stacks_ = NULL;
+ Static::PageHeapStorage Static::pageheap_;
++int Static::mpk_context_switches_ = 0;
++unsigned long *Static::mpk_context_switches_area_ = 0;
++int Static::mpk_alloc_pkey_ = 0;
++                                                                                
++static                                                                          
++inline void                                                                     
++wrpkru(unsigned int pkru) 
++{                                                                               
++    unsigned int eax = pkru;                                                    
++    unsigned int ecx = 0;                                                       
++    unsigned int edx = 0;                                                       
++                                                                                
++    asm volatile(".byte 0x0f,0x01,0xef\n\t"                                     
++                 : : "a" (eax), "c" (ecx), "d" (edx));                          
++}
+ 
+ void Static::InitStaticVars() {
++  int pkey = syscall(PKEY_ALLOC_NO, 0, PKEY_DISABLE_ACCESS);
++  /**
++  Log(kLog, __FILE__, __LINE__,
++        "pkey_alloc: ", pkey, strerror(errno)); */
++
++  mpk_alloc_pkey_ = pkey;
++  MPKStatic::pkey(pkey);
++  wrpkru(0);
++
+   sizemap_.Init();
+   span_allocator_.Init();
+   span_allocator_.New(); // Reduce cache conflicts
+@@ -100,6 +134,22 @@ void Static::InitStaticVars() {
+ 
+   inited_ = true;
+ 
++  /**
++  struct stat sb;
++
++  int fd = open("/root/switches", O_RDWR);
++  fstat(fd, &sb);
++
++  mpk_context_switches_area_ = (unsigned long*)mmap(NULL, sb.st_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
++  if (mpk_context_switches_area_ == MAP_FAILED) {
++    fprintf(stderr, "Could not mmap!");
++    exit(1);
++  }
++  (*mpk_context_switches_area_) = 0;
++
++  MPKStatic::context_switches_area(mpk_context_switches_area_);
++  */
++
+   DLL_Init(&sampled_objects_);
+ }
+ 
+diff --git a/third_party/tcmalloc/chromium/src/static_vars.h b/third_party/tcmalloc/chromium/src/static_vars.h
+index 3eeae0f..c2b17ae 100644
+--- a/third_party/tcmalloc/chromium/src/static_vars.h
++++ b/third_party/tcmalloc/chromium/src/static_vars.h
+@@ -46,6 +46,11 @@
+ #include "span.h"
+ #include "stack_trace_table.h"
+ 
++#include <unistd.h>
++#include <sys/syscall.h>
++#include <sys/types.h>
++
++
+ namespace tcmalloc {
+ 
+ class Static {
+@@ -87,6 +92,19 @@ class Static {
+     return &bucket_allocator_;
+   }
+ 
++  static void mpk_increment_context_switches() {
++    //mpk_context_switches_++;
++    //(*mpk_context_switches_area_)++;
++  };
++
++  static int mpk_context_switches() {
++    return mpk_context_switches_;
++  };
++
++  static int mpk_alloc_pkey() {
++    return mpk_alloc_pkey_;
++  };
++
+   // Check if InitStaticVars() has been run.
+   static bool IsInited() { return inited_; }
+ 
+@@ -107,6 +125,9 @@ class Static {
+   ATTRIBUTE_HIDDEN static PageHeapAllocator<Span> span_allocator_;
+   ATTRIBUTE_HIDDEN static PageHeapAllocator<StackTrace> stacktrace_allocator_;
+   ATTRIBUTE_HIDDEN static Span sampled_objects_;
++  ATTRIBUTE_HIDDEN static int mpk_context_switches_;
++  ATTRIBUTE_HIDDEN static unsigned long * mpk_context_switches_area_;
++  ATTRIBUTE_HIDDEN static int mpk_alloc_pkey_; 
+   ATTRIBUTE_HIDDEN static PageHeapAllocator<StackTraceTable::Bucket> bucket_allocator_;
+ 
+   // Linked list of stack traces recorded every time we allocated memory
+diff --git a/third_party/tcmalloc/chromium/src/tcmalloc.cc b/third_party/tcmalloc/chromium/src/tcmalloc.cc
+index 559082a..9058185 100644
+--- a/third_party/tcmalloc/chromium/src/tcmalloc.cc
++++ b/third_party/tcmalloc/chromium/src/tcmalloc.cc
+@@ -65,7 +65,7 @@
+ // in Populate() for pages with sizeclass > 0 objects, and in do_malloc() and
+ // do_memalign() for all other relevant pages.
+ //
+ // -------
+ // Page map contains a mapping from page id to Span.
+ //
+@@ -129,6 +129,7 @@
+ #include "sampler.h"              // for Sampler
+ #include "span.h"              // for Span, DLL_Prepend, etc
+ #include "stack_trace_table.h"  // for StackTraceTable
++#include "mpkalloc_vars.h"     // for MPKAlloc
+ #include "static_vars.h"       // for Static
+ #include "system-alloc.h"      // for DumpSystemAllocatorStats, etc
+ #include "tcmalloc_guard.h"    // for TCMallocGuard
+@@ -161,6 +162,7 @@ using tcmalloc::Sampler;
+ using tcmalloc::SizeMap;
+ using tcmalloc::Span;
+ using tcmalloc::StackTrace;
++using tcmalloc::MPKStatic;
+ using tcmalloc::Static;
+ using tcmalloc::ThreadCache;
+ 
+@@ -1881,6 +1883,64 @@ void* memalign_pages(size_t align, size_t size,
+ 
+ } // namespace tcmalloc
+ 
++
++static                                                                          
++inline void                                                                     
++pkey_write(unsigned int pkru)
++{                                                                               
++    asm volatile(".byte 0x0f,0x01,0xef\n\t"                                     
++                 : : "a" (pkru), "c" (0), "d" (0));                             
++}                                                                               
++                                                                                
++static                                                                          
++inline unsigned int                                                             
++pkey_read()                                                                     
++{                                                                               
++    unsigned int result;                                                        
++    asm volatile(".byte 0x0f,0x01,0xee\n\t"                                     
++                 : "=a" (result) : "c" (0) : "rdx");                            
++    return result;                                                              
++}                                                                               
++
++#define PKEY_DISABLE_ACCESS 0x1
++#define PKEY_DISABLE_WRITE  0x2
++
++static
++inline void
++mpkalloc_pkey_set(int key) {
++    unsigned int perms = (PKEY_DISABLE_ACCESS | PKEY_DISABLE_WRITE) << (2 * key);
++    unsigned int pkru = pkey_read();
++    // Check whether rights are already set
++    if (pkru & perms) {
++        return;
++    }
++    pkey_write(pkru | perms);
++}
++
++static
++inline void
++mpkalloc_pkey_unset(int key) {
++    unsigned int perms = (PKEY_DISABLE_ACCESS | PKEY_DISABLE_WRITE) << (2 * key);
++    unsigned int pkru = pkey_read();
++    // Check whether rights are already unset
++    if (!(pkru & perms)) {
++        return;
++    }
++
++    pkey_write(pkru & ~perms);
++}
++
++static inline void
++enable_defense() {
++  mpkalloc_pkey_set(MPKStatic::pkey());
++  return;                                                                       
++}
++
++static inline void disable_defense() {
++  mpkalloc_pkey_unset(MPKStatic::pkey());
++  return;
++}
++
+ // This is quick, fast-path-only implementation of malloc/new. It is
+ // designed to only have support for fast-path. It checks if more
+ // complex handling is needed (such as a pageheap allocation or
+@@ -1944,27 +2004,39 @@ static void* memalign_fast_path(size_t align, size_t size) {
+ 
+ extern "C" PERFTOOLS_DLL_DECL CACHELINE_ALIGNED_FN
+ void* tc_malloc(size_t size) PERFTOOLS_NOTHROW {
+-  return malloc_fast_path<tcmalloc::malloc_oom>(size);
++  //MPK
++  //printf("alloc!\n");
++  disable_defense();
++  void *p = malloc_fast_path<tcmalloc::malloc_oom>(size);
++  enable_defense();
++  return p; 
+ }
+ 
+ static ATTRIBUTE_ALWAYS_INLINE inline
+ void free_fast_path(void *ptr) {
++  disable_defense();
+   if (PREDICT_FALSE(!base::internal::delete_hooks_.empty())) {
+     tcmalloc::invoke_hooks_and_free(ptr);
++    enable_defense();
+     return;
+   }
+   do_free(ptr);
++  enable_defense();
+ }
+ 
+ extern "C" PERFTOOLS_DLL_DECL CACHELINE_ALIGNED_FN
+ void tc_free(void* ptr) PERFTOOLS_NOTHROW {
++  disable_defense();
+   free_fast_path(ptr);
++  enable_defense();
+ }
+ 
+ extern "C" PERFTOOLS_DLL_DECL CACHELINE_ALIGNED_FN
+ void tc_free_sized(void *ptr, size_t size) PERFTOOLS_NOTHROW {
++  disable_defense();
+   if (PREDICT_FALSE(!base::internal::delete_hooks_.empty())) {
+     tcmalloc::invoke_hooks_and_free(ptr);
++    enable_defense();
+     return;
+   }
+ #ifndef NO_TCMALLOC_SAMPLES
+@@ -1973,14 +2045,17 @@ void tc_free_sized(void *ptr, size_t size) PERFTOOLS_NOTHROW {
+   // nullptr for us.
+   if (PREDICT_FALSE((reinterpret_cast<uintptr_t>(ptr) & (kPageSize-1)) == 0)) {
+     tc_free(ptr);
++    enable_defense();
+     return;
+   }
+ #else
+   if (!ptr) {
++    enable_defense();
+     return;
+   }
+ #endif
+   do_free_with_callback(ptr, &InvalidFree, true, size);
++  enable_defense();
+ }
+ 
+ #ifdef TC_ALIAS
+@@ -2003,11 +2078,15 @@ extern "C" PERFTOOLS_DLL_DECL void tc_deletearray_sized(void *p, size_t size) PE
+ 
+ extern "C" PERFTOOLS_DLL_DECL void* tc_calloc(size_t n,
+                                               size_t elem_size) PERFTOOLS_NOTHROW {
++  disable_defense();
+   if (ThreadCache::IsUseEmergencyMalloc()) {
+-    return tcmalloc::EmergencyCalloc(n, elem_size);
++    void *p = tcmalloc::EmergencyCalloc(n, elem_size);
++    enable_defense();
++    return p; 
+   }
+   void* result = do_calloc(n, elem_size);
+   MallocHook::InvokeNewHook(result, n * elem_size);
++  enable_defense();
+   return result;
+ }
+ 
+@@ -2022,30 +2101,42 @@ TC_ALIAS(tc_free);
+ 
+ extern "C" PERFTOOLS_DLL_DECL void* tc_realloc(void* old_ptr,
+                                                size_t new_size) PERFTOOLS_NOTHROW {
++  disable_defense();
+   if (old_ptr == NULL) {
+     void* result = do_malloc_or_cpp_alloc(new_size);
+     MallocHook::InvokeNewHook(result, new_size);
++    enable_defense();
+     return result;
+   }
+   if (new_size == 0) {
+     MallocHook::InvokeDeleteHook(old_ptr);
+     do_free(old_ptr);
++    enable_defense();
+     return NULL;
+   }
+   if (PREDICT_FALSE(tcmalloc::IsEmergencyPtr(old_ptr))) {
++    enable_defense();
+     return tcmalloc::EmergencyRealloc(old_ptr, new_size);
+   }
+-  return do_realloc(old_ptr, new_size);
++  void *p = do_realloc(old_ptr, new_size);
++  enable_defense();
++  return p; 
+ }
+ 
+ extern "C" PERFTOOLS_DLL_DECL CACHELINE_ALIGNED_FN
+ void* tc_new(size_t size) {
+-  return malloc_fast_path<tcmalloc::cpp_throw_oom>(size);
++  disable_defense();
++  void *p = malloc_fast_path<tcmalloc::cpp_throw_oom>(size);
++  enable_defense();
++  return p; 
+ }
+ 
+ extern "C" PERFTOOLS_DLL_DECL CACHELINE_ALIGNED_FN
+ void* tc_new_nothrow(size_t size, const std::nothrow_t&) PERFTOOLS_NOTHROW {
+-  return malloc_fast_path<tcmalloc::cpp_nothrow_oom>(size);
++  disable_defense();
++  void *p = malloc_fast_path<tcmalloc::cpp_nothrow_oom>(size);
++  enable_defense();
++  return p; 
+ }
+ 
+ extern "C" PERFTOOLS_DLL_DECL void tc_delete(void* p) PERFTOOLS_NOTHROW
+@@ -2112,7 +2203,10 @@ TC_ALIAS(tc_delete_nothrow);
+ 
+ extern "C" PERFTOOLS_DLL_DECL CACHELINE_ALIGNED_FN
+ void* tc_memalign(size_t align, size_t size) PERFTOOLS_NOTHROW {
+-  return memalign_fast_path<tcmalloc::malloc_oom>(align, size);
++  disable_defense();
++  void *p = memalign_fast_path<tcmalloc::malloc_oom>(align, size);
++  enable_defense();
++  return p; 
+ }
+ 
+ extern "C" PERFTOOLS_DLL_DECL int tc_posix_memalign(
+diff --git a/third_party/tcmalloc/chromium/src/thread_cache.cc b/third_party/tcmalloc/chromium/src/thread_cache.cc
+index 8fea2ca..8ad78b6 100644
+--- a/third_party/tcmalloc/chromium/src/thread_cache.cc
++++ b/third_party/tcmalloc/chromium/src/thread_cache.cc
+@@ -475,6 +475,7 @@ void ThreadCache::DestroyThreadCache(void* ptr) {
+ }
+ 
+ void ThreadCache::DeleteCache(ThreadCache* heap) {
++  /**
+   Disable deleting the thread cache 
+   // Remove all memory from heap
+   heap->Cleanup();
+ 
+@@ -490,6 +491,7 @@ void ThreadCache::DeleteCache(ThreadCache* heap) {
+   unclaimed_cache_space_ += heap->max_size_;
+ 
+   threadcache_allocator.Delete(heap);
++  */
+ }
+ 
+ void ThreadCache::RecomputePerThreadCacheSize() {
+@@ -516,6 +518,8 @@ void ThreadCache::RecomputePerThreadCacheSize() {
+ }
+ 
+ void ThreadCache::GetThreadStats(uint64_t* total_bytes, uint64_t* class_count) {
++  /**
++  Disable Thread Stats
+   for (ThreadCache* h = thread_heaps_; h != NULL; h = h->next_) {
+     *total_bytes += h->Size();
+     if (class_count) {
+@@ -523,7 +527,7 @@ void ThreadCache::GetThreadStats(uint64_t* total_bytes, uint64_t* class_count) {
+         class_count[cl] += h->freelist_length(cl);
+       }
+     }
+-  }
++  } */
+ }
+ 
+ void ThreadCache::set_overall_thread_cache_size(size_t new_size) { 
